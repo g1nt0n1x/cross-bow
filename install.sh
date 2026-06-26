@@ -6,13 +6,18 @@
 #   official Go tarball instead.
 #
 #   Usage:
-#     ./install.sh                # install missing, heal broken, prompt to upgrade
+#     ./install.sh                # user-local install (tools in ~/go/bin, ~/.local/bin)
+#     ./install.sh --system       # system-wide: tools in /usr/local/bin for root + all users
 #     ./install.sh -y             # assume "yes" to every prompt (incl. upgrades)
 #     ./install.sh --upgrade      # force-upgrade everything to latest
 #     ./install.sh --no-upgrade   # only install/heal, never offer upgrades
 #     ./install.sh --force        # reinstall every tool from scratch
 #     ./install.sh --check        # diagnose only — install/change nothing
 #     ./install.sh -h
+#
+#   Run as your normal user (NOT `sudo ./install.sh`). The script self-elevates
+#   with sudo only where root is required; --system places tool binaries in
+#   /usr/local/bin so `sudo crossbow` works too.
 #
 set -uo pipefail
 
@@ -53,7 +58,7 @@ banner() {
 }
 
 # ── Flags ──────────────────────────────────────────────────────
-ASSUME_YES=0  FORCE=0  NO_UPGRADE=0  WANT_UPGRADE=0  CHECK_ONLY=0
+ASSUME_YES=0  FORCE=0  NO_UPGRADE=0  WANT_UPGRADE=0  CHECK_ONLY=0  SYSTEM=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -y|--yes)      ASSUME_YES=1; shift ;;
@@ -61,9 +66,10 @@ while [[ $# -gt 0 ]]; do
         --no-upgrade)  NO_UPGRADE=1; shift ;;
         --force)       FORCE=1; shift ;;
         --check)       CHECK_ONLY=1; shift ;;
+        --system)      SYSTEM=1; shift ;;
         -h|--help)
             setup_colors; banner
-            sed -n '4,24p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
             exit 0 ;;
         *) echo "Unknown flag: $1 (try -h)" >&2; exit 1 ;;
     esac
@@ -80,6 +86,11 @@ elif command -v sudo >/dev/null 2>&1; then
 else
     SUDO=""; CAN_ROOT=0
     log_warn "No root/sudo — installing everything under \$HOME"
+fi
+
+if [[ $SYSTEM -eq 1 && $CAN_ROOT -eq 0 ]]; then
+    log_err "--system needs root (install sudo or run as root) — aborting"
+    exit 1
 fi
 
 if [[ $CAN_ROOT -eq 1 ]]; then
@@ -229,6 +240,19 @@ go_install() { # go_install MODULE@latest NAME
     retry env GOFLAGS="-buildvcs=false" GOTOOLCHAIN=auto go install "$1"
 }
 
+# Copy a freshly-built user binary into /usr/local/bin (so root + every user gets it)
+system_place() { # NAME
+    [[ $SYSTEM -eq 1 && $CHECK_ONLY -eq 0 ]] || return 0
+    local name="$1" gobin
+    gobin="$(go env GOPATH 2>/dev/null)/bin"; [[ "$gobin" == "/bin" ]] && gobin="$HOME/go/bin"
+    [[ -x "$gobin/$name" ]] || return 0
+    if $SUDO install -m 0755 "$gobin/$name" "/usr/local/bin/$name" 2>/dev/null; then
+        log_ok "$name → /usr/local/bin (system-wide)"
+    else
+        log_warn "$name: could not copy to /usr/local/bin"
+    fi
+}
+
 ensure_go_tool() { # NAME MIN MODULE VERFN
     local name="$1" min="$2" module="$3" verfn="$4" cur
     log_step "$name"
@@ -250,6 +274,7 @@ ensure_go_tool() { # NAME MIN MODULE VERFN
             go_install "$module" "$name" || log_warn "$name upgrade failed — keeping $cur"
         fi
     fi
+    system_place "$name"
     cur="$($verfn)"
     if command -v "$name" >/dev/null 2>&1 && [[ -n "$cur" ]]; then
         log_ok "$name ready ($cur)"
@@ -266,17 +291,30 @@ dalfox_version() { { dalfox version 2>&1 || dalfox --version 2>&1; } | extract_v
 
 # ── arjun (pipx) ───────────────────────────────────────────────
 arjun_version() {
-    local v; v="$(pipx list --short 2>/dev/null | awk '/^arjun/{print $2}')"
-    [[ -z "$v" ]] && v="$(arjun --version 2>&1 | extract_ver)"
+    # arjun has no --version flag; read it from its own venv (works for user & --global, no sudo)
+    local v shebang py
+    if command -v arjun >/dev/null 2>&1; then
+        shebang="$(head -1 "$(command -v arjun)" 2>/dev/null)"; py="${shebang#\#!}"
+        [[ -x "$py" ]] && v="$("$py" -c 'import importlib.metadata as m; print(m.version("arjun"))' 2>/dev/null)"
+    fi
+    [[ -z "$v" ]] && v="$(pipx list --short 2>/dev/null | awk '/^arjun/{print $2; exit}')"
     echo "$v"
 }
 
 ensure_arjun() {
     log_step "arjun"
     command -v pipx >/dev/null 2>&1 || { log_err "arjun: pipx unavailable"; fail "arjun"; return; }
+    # pipx target: --global (root + all users, bins in /usr/local/bin) for --system, else per-user
+    local pipx_pre=() gflag=""
+    [[ $SYSTEM -eq 1 ]] && { pipx_pre=($SUDO); gflag="--global"; }
+
     local cur; cur="$(arjun_version)"
     local installed=0
-    pipx list --short 2>/dev/null | grep -q '^arjun' && installed=1
+    if [[ $SYSTEM -eq 1 ]]; then
+        [[ -x /usr/local/bin/arjun ]] && installed=1
+    else
+        pipx list --short 2>/dev/null | grep -q '^arjun' && installed=1
+    fi
 
     if [[ $CHECK_ONLY -eq 1 ]]; then
         if command -v arjun >/dev/null 2>&1 && arjun -h >/dev/null 2>&1; then
@@ -288,16 +326,16 @@ ensure_arjun() {
     fi
 
     if [[ $FORCE -eq 1 && $installed -eq 1 ]]; then
-        log_warn "arjun: --force reinstall"; retry pipx reinstall arjun || { fail "arjun"; return; }
+        log_warn "arjun: --force reinstall"; retry "${pipx_pre[@]}" pipx reinstall $gflag arjun || { fail "arjun"; return; }
     elif [[ $installed -eq 0 ]]; then
-        log_info "Installing arjun via pipx …"
-        retry pipx install arjun || { fail "arjun"; return; }
-    elif ! ver_ge "$cur" "$ARJUN_MIN"; then
-        log_warn "arjun $cur < $ARJUN_MIN — upgrading"; retry pipx upgrade arjun || { fail "arjun"; return; }
+        log_info "Installing arjun via pipx ${gflag:+(global) }…"
+        retry "${pipx_pre[@]}" pipx install $gflag arjun || { fail "arjun"; return; }
+    elif [[ -n "$cur" ]] && ! ver_ge "$cur" "$ARJUN_MIN"; then
+        log_warn "arjun $cur < $ARJUN_MIN — upgrading"; retry "${pipx_pre[@]}" pipx upgrade $gflag arjun || { fail "arjun"; return; }
     else
-        log_ok "arjun $cur (>= $ARJUN_MIN)"
+        log_ok "arjun ${cur:-installed} (>= $ARJUN_MIN)"
         if ask "Upgrade arjun to latest?"; then
-            pipx upgrade arjun >/dev/null 2>&1 || log_warn "arjun upgrade failed — keeping $cur"
+            "${pipx_pre[@]}" pipx upgrade $gflag arjun >/dev/null 2>&1 || log_warn "arjun upgrade failed — keeping ${cur:-current}"
         fi
     fi
 
@@ -349,6 +387,11 @@ ensure_crossbow() {
 
 # ── Run ────────────────────────────────────────────────────────
 [[ $CHECK_ONLY -eq 1 ]] && log_info "Running in ${BOLD}--check${RESET} mode (no changes will be made)"
+if [[ $SYSTEM -eq 1 ]]; then
+    log_info "Mode: ${BOLD}system-wide${RESET} — tools go to /usr/local/bin (root + all users)"
+else
+    log_info "Mode: ${BOLD}user${RESET} — tools go to ~/go/bin & ~/.local/bin (run with ${BOLD}--system${RESET} for root-wide)"
+fi
 
 ensure_python
 ensure_go
@@ -382,6 +425,9 @@ if [[ ${#FAILED[@]} -eq 0 ]]; then
     echo -e "  ${GREEN}${BOLD}All tools ready.${RESET}" >&2
     if [[ $CHECK_ONLY -eq 0 ]]; then
         echo -e "  ${DIM}Open a new shell (or 'source ~/.bashrc') so PATH updates take effect.${RESET}" >&2
+        if [[ $SYSTEM -eq 1 ]]; then
+            echo -e "  ${DIM}Tools are in /usr/local/bin — works for your user and ${BOLD}sudo crossbow${RESET}${DIM} too.${RESET}" >&2
+        fi
         echo -e "  Run: ${BOLD}crossbow -u https://target.com -H cookies.txt${RESET}" >&2
     fi
     echo -e "${BOLD}══════════════════════════════════════════${RESET}" >&2
